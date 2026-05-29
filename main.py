@@ -1,19 +1,17 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+import io
 import pandas as pd
 import numpy as np
-import io
-import json
-from pydantic import BaseModel
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.tree import DecisionTreeRegressor, DecisionTreeClassifier
 from sklearn.neighbors import KNeighborsRegressor, KNeighborsClassifier
-from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error, accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, accuracy_score, precision_score, recall_score, f1_score
 
-app = FastAPI(title="AnyoneDS - Motor de Processamento Científico")
+app = FastAPI(title="AnyoneDS AI Engine")
 
-# Habilitar CORS para o Lovable poder chamar a API de qualquer origem
+# Configuração de CORS para permitir conexões do Lovable sem bloqueios
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,128 +22,165 @@ app.add_middleware(
 
 @app.get("/")
 def home():
-    return {"status": "online", "message": "AnyoneDS AI Engine is running!"}
+    return {
+        "status": "online",
+        "message": "O motor de IA do AnyoneDS está pronto para processar dados!"
+    }
 
 @app.post("/analyze")
-async def analyze_csv(file: UploadFile = File(...)):
-    """Recebe a planilha e faz uma análise estatística preliminar"""
+async def analyze(file: UploadFile = File(...)):
     try:
         contents = await file.read()
+        # Lê o ficheiro CSV suportando delimitadores comuns
         df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
         
-        # Estatísticas básicas
-        total_rows = int(df.shape[0])
-        total_cols = int(df.shape[1])
-        missing_values = int(df.isnull().sum().sum())
-        
-        numeric_cols = [col for col in df.columns if pd.api.types.is_numeric_dtype(df[col])]
-        categorical_cols = [col for col in df.columns if col not in numeric_cols]
-        
-        # Gerar sumário descritivo simples das colunas
-        summary = {}
-        for col in numeric_cols:
-            summary[col] = {
-                "mean": float(df[col].mean()),
-                "min": float(df[col].min()),
-                "max": float(df[col].max()),
-                "std": float(df[col].std())
+        # Gerar estatísticas descritivas básicas de forma segura
+        summary = []
+        for col in df.columns:
+            col_type = str(df[col].dtype)
+            missing = int(df[col].isnull().sum())
+            unique_vals = int(df[col].nunique())
+            
+            stats = {
+                "column": col,
+                "type": col_type,
+                "missing": missing,
+                "unique": unique_vals
             }
-
+            
+            # Adiciona métricas estatísticas apenas se a coluna for numérica
+            if np.issubdtype(df[col].dtype, np.number):
+                stats["mean"] = float(df[col].mean()) if not pd.isna(df[col].mean()) else 0.0
+                stats["min"] = float(df[col].min()) if not pd.isna(df[col].min()) else 0.0
+                stats["max"] = float(df[col].max()) if not pd.isna(df[col].max()) else 0.0
+            else:
+                stats["mean"] = None
+                stats["min"] = None
+                stats["max"] = None
+            summary.append(stats)
+            
+        # Obter as primeiras 10 linhas para pré-visualização no dashboard
+        preview = df.head(10).replace({np.nan: None}).to_dict(orient="records")
+        
         return {
             "columns": list(df.columns),
-            "numeric_columns": numeric_cols,
-            "categorical_columns": categorical_cols,
-            "shape": {"rows": total_rows, "cols": total_cols},
-            "missing_values": missing_values,
-            "summary_statistics": summary,
-            "preview_data": json.loads(df.head(10).to_json(orient="records"))
+            "rows_count": len(df),
+            "cols_count": len(df.columns),
+            "summary": summary,
+            "preview": preview
         }
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Erro ao processar arquivo: {str(e)}")
+        # Retorna erro 400 em vez de 500 para fornecer feedback explícito ao frontend
+        raise HTTPException(status_code=400, detail=f"Erro ao analisar o ficheiro CSV: {str(e)}")
 
 @app.post("/train")
-async def train_model(
+async def train(
     file: UploadFile = File(...),
     target_col: str = Form(...),
-    problem_type: str = Form(...), # "regressao" ou "classificacao"
-    model_name: str = Form(...),   # "linear_regression", "decision_tree", "knn"
-    test_size: float = Form(...)   # Ex: 0.2
+    problem_type: str = Form(...),
+    model_name: str = Form(...),
+    test_size: float = Form(...)
 ):
-    """Treina o modelo baseado no input do usuário no Lovable e retorna resultados"""
     try:
         contents = await file.read()
         df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
         
         if target_col not in df.columns:
-            raise HTTPException(status_code=400, detail="Coluna alvo não encontrada na planilha")
+            raise ValueError(f"A coluna alvo '{target_col}' não existe no ficheiro carregado.")
             
-        # Remover valores nulos básicos para evitar erros de ML
-        df = df.dropna()
+        # 1. Tratamento robusto de valores em falta (NaN)
+        for col in df.columns:
+            if df[col].isnull().sum() > 0:
+                if np.issubdtype(df[col].dtype, np.number):
+                    df[col] = df[col].fillna(df[col].median())
+                else:
+                    df[col] = df[col].fillna(df[col].mode()[0] if not df[col].mode().empty else "Desconhecido")
         
-        # Separar variáveis X e y
-        # Para este MVP simples, vamos focar apenas em colunas numéricas como preditores
-        numeric_cols = [col for col in df.columns if pd.api.types.is_numeric_dtype(df[col]) and col != target_col]
-        
-        if len(numeric_cols) == 0:
-            raise HTTPException(status_code=400, detail="Não há variáveis numéricas suficientes para o treino.")
-            
-        X = df[numeric_cols]
+        # 2. Divisão entre Variável Alvo (y) e Recursos (X)
         y = df[target_col]
+        X = df.drop(columns=[target_col])
         
-        # Split de dados
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
+        # 3. Tratamento de variáveis de texto (One-Hot Encoding automático para colunas não-numéricas)
+        X = pd.get_dummies(X, drop_first=True)
         
-        # Selecionar e instanciar o modelo correto
+        # Converte booleanos de colunas dummy em inteiros (0 e 1) para evitar incompatibilidade
+        for col in X.columns:
+            if X[col].dtype == bool:
+                X[col] = X[col].astype(int)
+                
+        # Garante que temos dados suficientes para realizar o treino
+        if len(X) < 3:
+            raise ValueError("O conjunto de dados contém poucas linhas para realizar um treino consistente.")
+
+        # 4. Divisão em conjuntos de Treino e Teste de forma dinâmica
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size, random_state=42
+        )
+        
+        # 5. Inicialização dinâmica do algoritmo selecionado pelo utilizador
         model = None
-        if problem_type == "regressao":
+        if problem_type == "regression":
             if model_name == "linear_regression":
                 model = LinearRegression()
             elif model_name == "decision_tree":
-                model = DecisionTreeRegressor(max_depth=5)
+                model = DecisionTreeRegressor(random_state=42)
             elif model_name == "knn":
-                model = KNeighborsRegressor(n_neighbors=5)
-        elif problem_type == "classificacao":
-            if model_name == "linear_regression": # Na vdd logística para classificação
-                model = LogisticRegression()
-            elif model_name == "decision_tree":
-                model = DecisionTreeClassifier(max_depth=5)
-            elif model_name == "knn":
-                model = KNeighborsClassifier(n_neighbors=5)
+                model = KNeighborsRegressor()
+            else:
+                raise ValueError(f"Algoritmo de regressão '{model_name}' não é suportado.")
                 
-        if model is None:
-            raise HTTPException(status_code=400, detail="Modelo inválido selecionado")
+        elif problem_type == "classification":
+            # Para classificação, garantimos que o target é interpretado de forma discreta
+            y_train = y_train.astype(str)
+            y_test = y_test.astype(str)
             
-        # Treinar o algoritmo
+            if model_name == "logistic_regression":
+                model = LogisticRegression(max_iter=1000)
+            elif model_name == "decision_tree":
+                model = DecisionTreeClassifier(random_state=42)
+            elif model_name == "knn":
+                model = KNeighborsClassifier()
+            else:
+                raise ValueError(f"Algoritmo de classificação '{model_name}' não é suportado.")
+        else:
+            raise ValueError(f"Tipo de problema '{problem_type}' não reconhecido.")
+            
+        # 6. Ajustar o Modelo
         model.fit(X_train, y_train)
         
-        # Realizar previsões na base de teste
+        # 7. Executar as Previsões
         y_pred = model.predict(X_test)
         
-        # Calcular as métricas científicas
+        # 8. Cálculo de Métricas de Performance
         metrics = {}
-        if problem_type == "regressao":
+        if problem_type == "regression":
             metrics["r2"] = float(r2_score(y_test, y_pred))
             metrics["mae"] = float(mean_absolute_error(y_test, y_pred))
             metrics["rmse"] = float(np.sqrt(mean_squared_error(y_test, y_pred)))
         else:
             metrics["accuracy"] = float(accuracy_score(y_test, y_pred))
-            metrics["precision"] = float(precision_score(y_test, y_pred, average='weighted', zero_division=0))
-            metrics["recall"] = float(recall_score(y_test, y_pred, average='weighted', zero_division=0))
-            metrics["f1"] = float(f1_score(y_test, y_pred, average='weighted', zero_division=0))
-
-        # Estruturar dados de saída para os gráficos no Lovable (Real vs Previsto)
+            metrics["precision"] = float(precision_score(y_test, y_pred, average="weighted", zero_division=0))
+            metrics["recall"] = float(recall_score(y_test, y_pred, average="weighted", zero_division=0))
+            metrics["f1"] = float(f1_score(y_test, y_pred, average="weighted", zero_division=0))
+            
+        # 9. Construção dos dados reais vs. previstos para renderização gráfica no Lovable
+        real_values = [float(val) if np.issubdtype(type(val), np.number) else val for val in y_test]
+        pred_values = [float(val) if np.issubdtype(type(val), np.number) else val for val in y_pred]
+        
         chart_data = []
-        for real, pred in zip(y_test.values, y_pred):
+        for i in range(len(real_values)):
             chart_data.append({
-                "real": float(real),
-                "predicted": float(pred)
+                "index": i + 1,
+                "real": real_values[i],
+                "previsto": pred_values[i]
             })
             
         return {
+            "success": True,
             "metrics": metrics,
-            "chart_data": chart_data[:100], # Limitar a 100 pontos para manter a renderização leve no React
-            "features_used": numeric_cols
+            "chart_data": chart_data
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro interno no treino: {str(e)}")
+        # Se ocorrer algum erro matemático ou lógico, o FastAPI informará o erro de forma limpa
+        raise HTTPException(status_code=400, detail=f"Erro durante o treino do modelo: {str(e)}")
