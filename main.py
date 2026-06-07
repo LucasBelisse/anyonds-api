@@ -34,6 +34,7 @@ async def analyze(file: UploadFile = File(...)):
         contents = await file.read()
         df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
         
+        # Gerar estatísticas descritivas básicas de forma segura
         summary = []
         for col in df.columns:
             col_type = str(df[col].dtype)
@@ -47,17 +48,32 @@ async def analyze(file: UploadFile = File(...)):
                 "unique": unique_vals
             }
             
+            # Tratamento blindado de métricas estatísticas de nulos e infinitos
             if np.issubdtype(df[col].dtype, np.number):
-                stats["mean"] = float(df[col].mean()) if not pd.isna(df[col].mean()) else 0.0
-                stats["min"] = float(df[col].min()) if not pd.isna(df[col].min()) else 0.0
-                stats["max"] = float(df[col].max()) if not pd.isna(df[col].max()) else 0.0
+                mean_val = df[col].mean()
+                min_val = df[col].min()
+                max_val = df[col].max()
+                
+                stats["mean"] = float(mean_val) if pd.notnull(mean_val) and not np.isinf(mean_val) else None
+                stats["min"] = float(min_val) if pd.notnull(min_val) and not np.isinf(min_val) else None
+                stats["max"] = float(max_val) if pd.notnull(max_val) and not np.isinf(max_val) else None
             else:
                 stats["mean"] = None
                 stats["min"] = None
                 stats["max"] = None
             summary.append(stats)
             
-        preview = df.head(15).replace({np.nan: None}).to_dict(orient="records")
+        # BLINDAGEM JSON: Obtém prévia das 15 linhas limpando NaN/inf por None recursivamente
+        raw_preview = df.head(15).to_dict(orient="records")
+        preview = []
+        for record in raw_preview:
+            cleaned_record = {}
+            for k, v in record.items():
+                if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+                    cleaned_record[k] = None
+                else:
+                    cleaned_record[k] = v
+            preview.append(cleaned_record)
         
         return {
             "columns": list(df.columns),
@@ -92,8 +108,17 @@ async def sql_query(
         result_df = pd.read_sql_query(query, conn)
         conn.close()
         
-        # Substitui valores nulos por None para evitar erros no JSON
-        result_preview = result_df.head(100).replace({np.nan: None}).to_dict(orient="records")
+        # BLINDAGEM JSON: Substitui valores NaN por None de forma limpa para o SQLite
+        raw_results = result_df.head(100).to_dict(orient="records")
+        result_preview = []
+        for record in raw_results:
+            cleaned_record = {}
+            for k, v in record.items():
+                if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+                    cleaned_record[k] = None
+                else:
+                    cleaned_record[k] = v
+            result_preview.append(cleaned_record)
         
         return {
             "success": True,
@@ -103,7 +128,6 @@ async def sql_query(
             "query_executed": query
         }
     except Exception as e:
-        # Repassa o erro de sintaxe do SQL de forma limpa para o usuário aprender e corrigir
         raise HTTPException(status_code=400, detail=f"Erro de sintaxe SQL: {str(e)}")
 
 @app.post("/train")
