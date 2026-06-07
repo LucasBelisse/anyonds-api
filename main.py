@@ -108,7 +108,11 @@ async def analyze(file: UploadFile = File(...)):
             # Tratamento blindado de métricas estatísticas de nulos e infinitos
             if np.issubdtype(df[col].dtype, np.number):
                 col_clean = df[col].dropna()
-                col_clean = col_clean[~np.isinf(col_clean)]
+                
+                # CORREÇÃO CIRÚRGICA: Só testa infinitos (isinf) se a coluna for do tipo decimal (float/floating)
+                # Números inteiros (int64) geravam erro de tipo nesta função e causavam o crash do HTTP 400
+                if np.issubdtype(df[col].dtype, np.floating):
+                    col_clean = col_clean[~np.isinf(col_clean)]
                 
                 if len(col_clean) > 0:
                     stats["mean"] = clean_nan_values(col_clean.mean())
