@@ -21,6 +21,63 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def clean_nan_values(data):
+    """
+    Função recursiva e blindada para remover NaNs, Infinities e tipos NumPy incompatíveis,
+    convertendo-os de forma segura em 'None' (null no JSON) ou tipos primitivos do Python.
+    """
+    if isinstance(data, list):
+        return [clean_nan_values(item) for item in data]
+    elif isinstance(data, dict):
+        return {k: clean_nan_values(v) for k, v in data.items()}
+    elif isinstance(data, (float, np.floating)):
+        if np.isnan(data) or np.isinf(data) or pd.isna(data):
+            return None
+        return float(data)
+    elif isinstance(data, (int, np.integer)):
+        return int(data)
+    elif pd.isna(data):
+        return None
+    else:
+        return data
+
+def safe_read_csv(contents: bytes) -> pd.DataFrame:
+    """
+    Decodifica bytes do arquivo e detecta automaticamente o delimitador de colunas (vírgula ou ponto e vírgula),
+    comportando-se de forma flexível para arquivos salvos em Excel com localidade brasileira.
+    """
+    decoded = None
+    for encoding in ['utf-8', 'latin-1', 'cp1252', 'utf-16']:
+        try:
+            decoded = contents.decode(encoding)
+            break
+        except Exception:
+            continue
+            
+    if decoded is None:
+        decoded = contents.decode('utf-8', errors='ignore')
+        
+    try:
+        # Tenta inferir o delimitador olhando a primeira linha
+        first_line = decoded.split('\n')[0] if '\n' in decoded else decoded
+        if ';' in first_line and ',' not in first_line:
+            sep = ';'
+        elif '\t' in first_line:
+            sep = '\t'
+        else:
+            sep = ','
+            
+        df = pd.read_csv(io.StringIO(decoded), sep=sep)
+    except Exception:
+        try:
+            df = pd.read_csv(io.StringIO(decoded), sep=None, engine='python')
+        except Exception:
+            df = pd.read_csv(io.StringIO(decoded))
+            
+    # Limpa espaços em branco indesejados nas colunas
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
 @app.get("/")
 def home():
     return {
@@ -32,7 +89,7 @@ def home():
 async def analyze(file: UploadFile = File(...)):
     try:
         contents = await file.read()
-        df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
+        df = safe_read_csv(contents)
         
         # Gerar estatísticas descritivas básicas de forma segura
         summary = []
@@ -50,38 +107,34 @@ async def analyze(file: UploadFile = File(...)):
             
             # Tratamento blindado de métricas estatísticas de nulos e infinitos
             if np.issubdtype(df[col].dtype, np.number):
-                mean_val = df[col].mean()
-                min_val = df[col].min()
-                max_val = df[col].max()
+                col_clean = df[col].dropna()
+                col_clean = col_clean[~np.isinf(col_clean)]
                 
-                stats["mean"] = float(mean_val) if pd.notnull(mean_val) and not np.isinf(mean_val) else None
-                stats["min"] = float(min_val) if pd.notnull(min_val) and not np.isinf(min_val) else None
-                stats["max"] = float(max_val) if pd.notnull(max_val) and not np.isinf(max_val) else None
+                if len(col_clean) > 0:
+                    stats["mean"] = clean_nan_values(col_clean.mean())
+                    stats["min"] = clean_nan_values(col_clean.min())
+                    stats["max"] = clean_nan_values(col_clean.max())
+                else:
+                    stats["mean"] = None
+                    stats["min"] = None
+                    stats["max"] = None
             else:
                 stats["mean"] = None
                 stats["min"] = None
                 stats["max"] = None
             summary.append(stats)
             
-        # BLINDAGEM JSON: Obtém prévia das 15 linhas limpando NaN/inf por None recursivamente
+        # Obter prévia das primeiras 15 linhas limpas de NaNs de forma recursiva
         raw_preview = df.head(15).to_dict(orient="records")
-        preview = []
-        for record in raw_preview:
-            cleaned_record = {}
-            for k, v in record.items():
-                if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
-                    cleaned_record[k] = None
-                else:
-                    cleaned_record[k] = v
-            preview.append(cleaned_record)
+        preview = clean_nan_values(raw_preview)
         
-        return {
+        return clean_nan_values({
             "columns": list(df.columns),
             "rows_count": len(df),
             "cols_count": len(df.columns),
             "summary": summary,
             "preview": preview
-        }
+        })
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Erro ao analisar o ficheiro CSV: {str(e)}")
 
@@ -96,7 +149,7 @@ async def sql_query(
     """
     try:
         contents = await file.read()
-        df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
+        df = safe_read_csv(contents)
         
         # Cria uma conexão com banco SQLite em memória
         conn = sqlite3.connect(":memory:")
@@ -108,25 +161,17 @@ async def sql_query(
         result_df = pd.read_sql_query(query, conn)
         conn.close()
         
-        # BLINDAGEM JSON: Substitui valores NaN por None de forma limpa para o SQLite
+        # Sanitização robusta dos resultados da query SQL
         raw_results = result_df.head(100).to_dict(orient="records")
-        result_preview = []
-        for record in raw_results:
-            cleaned_record = {}
-            for k, v in record.items():
-                if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
-                    cleaned_record[k] = None
-                else:
-                    cleaned_record[k] = v
-            result_preview.append(cleaned_record)
+        result_preview = clean_nan_values(raw_results)
         
-        return {
+        return clean_nan_values({
             "success": True,
             "columns": list(result_df.columns),
             "rows_count": len(result_df),
             "preview": result_preview,
             "query_executed": query
-        }
+        })
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Erro de sintaxe SQL: {str(e)}")
 
@@ -140,11 +185,12 @@ async def train(
 ):
     try:
         contents = await file.read()
-        df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
+        df = safe_read_csv(contents)
         
         if target_col not in df.columns:
             raise ValueError(f"A coluna alvo '{target_col}' não existe no ficheiro carregado.")
             
+        # Limpeza robusta antes de rodar o pipeline de ML
         for col in df.columns:
             if df[col].isnull().sum() > 0:
                 if np.issubdtype(df[col].dtype, np.number):
@@ -155,6 +201,7 @@ async def train(
         y = df[target_col]
         X = df.drop(columns=[target_col])
         
+        # Conversão de colunas categóricas para dummies
         X = pd.get_dummies(X, drop_first=True)
         
         for col in X.columns:
@@ -219,11 +266,11 @@ async def train(
                 "previsto": pred_values[i]
             })
             
-        return {
+        return clean_nan_values({
             "success": True,
             "metrics": metrics,
             "chart_data": chart_data
-        }
+        })
         
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Erro durante o treino do modelo: {str(e)}")
