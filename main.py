@@ -100,17 +100,17 @@ async def analyze(file: UploadFile = File(...)):
             
             stats = {
                 "column": col,
-                "type": col_type,
+                "type": "Misto/Texto" if "string" in col_type.lower() or "object" in col_type.lower() else col_type,
                 "missing": missing,
                 "unique": unique_vals
             }
             
-            # Tratamento blindado de métricas estatísticas: só calcula se for numérico
-            if np.issubdtype(df[col].dtype, np.number):
+            # PROTEÇÃO COM APIS NATIVAS DO PANDAS (Evita o TypeError do NumPy com StringDtype)
+            if pd.api.types.is_numeric_dtype(df[col]):
                 col_clean = df[col].dropna()
                 
                 # Só testa infinitos se a coluna for do tipo decimal (float/floating)
-                if np.issubdtype(df[col].dtype, np.floating):
+                if pd.api.types.is_float_dtype(df[col]):
                     col_clean = col_clean[~np.isinf(col_clean)]
                 
                 if len(col_clean) > 0:
@@ -198,7 +198,7 @@ async def train(
         # Limpeza robusta antes de rodar o pipeline de ML
         for col in df.columns:
             if df[col].isnull().sum() > 0:
-                if np.issubdtype(df[col].dtype, np.number):
+                if pd.api.types.is_numeric_dtype(df[col]):
                     df[col] = df[col].fillna(df[col].median())
                 else:
                     df[col] = df[col].fillna(df[col].mode()[0] if not df[col].mode().empty else "Desconhecido")
@@ -260,8 +260,9 @@ async def train(
             metrics["recall"] = float(recall_score(y_test, y_pred, average="weighted", zero_division=0))
             metrics["f1"] = float(f1_score(y_test, y_pred, average="weighted", zero_division=0))
             
-        real_values = [float(val) if np.issubdtype(type(val), np.number) else val for val in y_test]
-        pred_values = [float(val) if np.issubdtype(type(val), np.number) else val for val in y_pred]
+        # Extração e conversão limpa para o JSON do gráfico
+        real_values = [float(val) if isinstance(val, (int, float, np.number)) and not pd.isna(val) else val for val in y_test]
+        pred_values = [float(val) if isinstance(val, (int, float, np.number)) and not pd.isna(val) else val for val in y_pred]
         
         chart_data = []
         for i in range(len(real_values)):
